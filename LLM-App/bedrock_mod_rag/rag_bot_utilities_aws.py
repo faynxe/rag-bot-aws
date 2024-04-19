@@ -28,9 +28,36 @@ from requests_aws4auth import AWS4Auth
 import re
 from opensearchpy import Transport
 TEXTRACT_RESULT_CACHE_PATH='textract-output'
-OS_ENDPOINT="search-rag2-fj5bhrqjlj7bhezstpki46uhlm.us-east-1.es.amazonaws.com"
 SAGEMAKER=boto3.client("sagemaker")
+KB_AGENT= boto3.client('bedrock-agent-runtime')
+APP_MD    = json.load(open('application_metadata_complete.json', 'r'))
+OS_ENDPOINT=APP_MD['opensearch']['domain_endpoint']
+KENDRA_INDEX= APP_MD['Kendra']['index']
+KB_INDEX= APP_MD['KnowledgeBase']['index']
 
+def query_index(query,params): 
+    KENDRA=boto3.client("kendra")
+    response = KENDRA.retrieve(
+        IndexId=KENDRA_INDEX,
+        QueryText=query,
+        PageSize=int(params["K"])
+    )
+    return response
+
+def query_kb_index(query,params): 
+
+    response = KB_AGENT.retrieve(
+            retrievalQuery= {
+                'text': query
+            },
+            knowledgeBaseId=KB_INDEX,
+            retrievalConfiguration= {
+                'vectorSearchConfiguration': {
+                    'numberOfResults': int(params["K"]) # will fetch top 3 documents which matches closely with the query.
+                }
+            }
+        )
+    return response
 
 def get_s3_keys(bucket, prefix):
     s3 = boto3.client('s3')
@@ -620,7 +647,7 @@ class InvalidContentError(Exception):
     pass
 
 # Extract relevant information from the search response
-def content_extraction_os_(response:str, table:bool, section_content:str, bucket):
+def content_extraction_os_(response:str, table:bool, section_content:str, bucket:str, params):
     """
     Extracts content from the OpenSearch response based on specified parameters.
 
@@ -632,36 +659,58 @@ def content_extraction_os_(response:str, table:bool, section_content:str, bucket
     Returns:
     tuple: A tuple containing concatenated passages and tables.
     """
-    allowed_values = {"passage", "section_header", "section_title"}  # Define allowed values
-    if section_content not in allowed_values:
-        raise InvalidContentError(f"Invalid content type '{section_content}'. Allowed values are {', '.join(allowed_values)}.")
-    
-    res=response['hits']['hits']
-    score = [str(x['_score']) for x in res]  #retrieval score    
-    title_names = [x['_source']['title_headers'] for x in res] #doc page number of chunks
-    doc_name = [x['_source']['doc_id'] for x in res] # doc names
-    header_ids = [x['_source']['section_header_ids'] for x in res] # section header id
-    title_ids=[x['_source']['section_title_ids'] for x in res] # section title id
-    tables=""
-    
-    if section_content=="passage":
-        passage = [x['_source']["passage"] for x in res] #retrieved passages, here you can choose to retrieve the  complete section header or title instead of the chunk passage
-        tables=[x['_source']['table'] for x in res] # tables in the corresponding chunk
-    else:
-        passage=[]
-        for x in range(len(title_ids)):
-            passage.append(read_file_from_s3(bucket, f"{doc_name[x]}.json",section_content,title_ids[x],header_ids[x]))
-        passage=set(passage)      
-    p = inflect.engine()
-    ## Concatenate passages and tables to use in prompt template 
-    passages=""
-    tab=""
-    for  ids,text in enumerate(passage):
-        passages+=f"<{p.ordinal(ids+1)}_passage>\n{text}\n</{p.ordinal(ids+1)}_passage>\n"
-    if table and tables:
-        for  ids,text in enumerate(tables):            
-            tab+=f"<{p.ordinal(ids+1)}_passage_table>\n{text}\n</{p.ordinal(ids+1)}_passage_table>\n"  #Table can be coupled with passage chunks to provide more information.
-    return passages, tab,doc_name
+    if "knowledgebase" in params['rag'].lower():
+        score = [x['score'] for x in response['retrievalResults']]             
+        passage = [x['content']['text'] for x in response['retrievalResults']]
+        doc_link = [os.path.basename(x['location']['s3Location']['uri']) for x in response['retrievalResults']]
+        p = inflect.engine()
+        ## Concatenate passages and tables to use in prompt template 
+        passages=""       
+        for  ids,text in enumerate(passage):
+            passages+=f"<{p.ordinal(ids+1)}_passage>\n{text}\n</{p.ordinal(ids+1)}_passage>\n"
+        return passages, passage,doc_link
+    elif "kendra" in params['rag'].lower():
+        score = [x['ScoreAttributes']["ScoreConfidence"] for x in response['ResultItems']]             
+        passage = [x['Content'] for x in response['ResultItems']]
+        doc_link = [os.path.basename(x['DocumentURI']) for x in response['ResultItems']]
+        p = inflect.engine()
+        ## Concatenate passages and tables to use in prompt template 
+        passages=""       
+        for  ids,text in enumerate(passage):
+            passages+=f"<{p.ordinal(ids+1)}_passage>\n{text}\n</{p.ordinal(ids+1)}_passage>\n"
+        return passages, passage,doc_link
+        
+    elif "opensearch" in params['rag'].lower():
+        allowed_values = {"passage", "section_header", "section_title"}  # Define allowed values
+        if section_content not in allowed_values:
+            raise InvalidContentError(f"Invalid content type '{section_content}'. Allowed values are {', '.join(allowed_values)}.")
+
+        res=response['hits']['hits']
+        score = [str(x['_score']) for x in res]  #retrieval score    
+        title_names = [x['_source']['title_headers'] for x in res] #doc page number of chunks
+        doc_name = [x['_source']['doc_id'] for x in res] # doc names
+        header_ids = [x['_source']['section_header_ids'] for x in res] # section header id
+        title_ids=[x['_source']['section_title_ids'] for x in res] # section title id
+        tables=""
+
+        if section_content=="passage":
+            passage = [x['_source']["passage"] for x in res] #retrieved passages, here you can choose to retrieve the  complete section header or title instead of the chunk passage
+            tables=[x['_source']['table'] for x in res] # tables in the corresponding chunk
+        else:
+            passage=[]
+            for x in range(len(title_ids)):
+                passage.append(read_file_from_s3(bucket, f"{doc_name[x]}.json",section_content,title_ids[x],header_ids[x]))
+            passage=set(passage)      
+        p = inflect.engine()
+        ## Concatenate passages and tables to use in prompt template 
+        passages=""
+        tab=""
+        for  ids,text in enumerate(passage):
+            passages+=f"<{p.ordinal(ids+1)}_passage>\n{text}\n</{p.ordinal(ids+1)}_passage>\n"
+        if table and tables:
+            for  ids,text in enumerate(tables):            
+                tab+=f"<{p.ordinal(ids+1)}_passage_table>\n{text}\n</{p.ordinal(ids+1)}_passage_table>\n"  #Table can be coupled with passage chunks to provide more information.
+        return passages, tab,doc_name
 
 def opensearch_document_loader_aws(params,chunks,table_header_dict,doc_id):
     """
