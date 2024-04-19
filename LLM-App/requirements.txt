@@ -1,0 +1,17 @@
+boto3
+pandas
+streamlit
+pillow
+PyPDF2
+tiktoken
+tqdm
+pyyaml
+anthropic
+sentencepiece
+pymupdf
+tokenizers
+transformers
+opensearch-py
+requests-aws4auth
+inflect
+openpyxl
