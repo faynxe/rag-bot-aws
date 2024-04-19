@@ -53,8 +53,7 @@ TEXTRACT      = boto3.client('textract', region_name=REGION)
 KENDRA        = boto3.client('kendra', region_name=REGION)
 SAGEMAKER     = boto3.client('sagemaker-runtime', region_name=REGION)
 BEDROCK = boto3.client(service_name='bedrock-runtime',region_name='us-east-1') 
-COMPREHEND=boto3.client("comprehend")
-
+KENDRA_INDEX="b3b83a9c-0de7-4791-b8b8-28caf96f6161"
 # Vector dimension mappings of each embedding model
 EMB_MODEL_DICT={"titan":1536,
                 "minilmv2":384,
@@ -111,6 +110,10 @@ if 'action_name' not in st.session_state:
     st.session_state['action_name'] = ""
 if 'chat_memory' not in st.session_state:
     st.session_state['chat_memory']=""
+if 'input_token' not in st.session_state:
+    st.session_state['input_token']=0
+if 'output_token' not in st.session_state:
+    st.session_state['output_token']=0
 
 
 def load_document(file_bytes, doc_name, params):
@@ -133,10 +136,23 @@ def load_document(file_bytes, doc_name, params):
     params['dimension']=EMB_MODEL_DICT[params['emb'].lower()]
     rag_bot_utilities_aws.opensearch_document_loader_aws(params,chunks,table_header_dict,doc_name)
     
+    
+
+    
 def query_llm(params,prompt,handler):
-    params['pipeline_name']="normalization-pipe"
-    response=rag_bot_utilities_aws.similarity_search(prompt, params)
-    response,tables,doc_name=rag_bot_utilities_aws.content_extraction_os_(response, True, "passage", BUCKET)
+    if "opensearch" in params['rag'].lower():
+        params['pipeline_name']="normalization-pipe"
+        response=rag_bot_utilities_aws.similarity_search(prompt, params)
+        response,tables,doc_name=rag_bot_utilities_aws.content_extraction_os_(response, True, "passage", BUCKET,params)
+    elif "kendra" in params['rag'].lower():
+        response=rag_bot_utilities_aws.query_index(prompt,params)
+        response,passage_list,doc_name=rag_bot_utilities_aws.content_extraction_os_(response, True, "passage", BUCKET,params)
+        tables=""
+    elif "knowledgebase" in params['rag'].lower():
+        response=rag_bot_utilities_aws.query_kb_index(prompt,params)
+        response,passage_list,doc_name=rag_bot_utilities_aws.content_extraction_os_(response, True, "passage", BUCKET,params)
+        tables=""
+
     # st.write(response)
     with open("prompt_template/rag/claude/prompt1.txt","r")as f:
         prompt_template=f.read()
@@ -155,39 +171,36 @@ def query_llm(params,prompt,handler):
     "input_token":round(st.session_state['input_token']) ,
     "output_token":round(st.session_state['output_token'])} 
     #store convsation memory and user other items in DynamoDB table
-    conversation_history_retriever_aws.put_db(chat_history,DYNAMODB_TABLE,DYNAMODB_USER,st.session_state['user_sess'])
-    # use local memory for storage
-   
-    return response
+    # conversation_history_retriever_aws.put_db(chat_history,DYNAMODB_TABLE,DYNAMODB_USER,st.session_state['user_sess'])
+    # use local memory for storage   
+    return answer, doc_name
         
         
 
 def action_doc(params):   
-    conversation_history=conversation_history_retriever_aws.get_chat_history_db(DYNAMODB_TABLE,DYNAMODB_USER,st.session_state['user_sess'],10)
-    st.session_state.messages,params['chat_histories']=conversation_history_retriever_aws.get_chat_historie_for_streamlit(DYNAMODB_TABLE, DYNAMODB_USER, st.session_state['user_sess'])
-    # st.write(st.session_state.messages)
+    # conversation_history=conversation_history_retriever_aws.get_chat_history_db(DYNAMODB_TABLE,DYNAMODB_USER,st.session_state['user_sess'],10)
+    # st.session_state.messages,params['chat_histories']=conversation_history_retriever_aws.get_chat_historie_for_streamlit(DYNAMODB_TABLE, DYNAMODB_USER, st.session_state['user_sess'])
     st.title('Ask Questions of your Document')
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):         
             st.markdown(message["content"].replace("$", "\$"),unsafe_allow_html=True )
             if message["role"]=="assistant":
-                if message["attachment"]:
+                if "attachment" in message and message["attachment"]:
                     with st.expander(label="**attachments**"):
                         st.markdown(message["attachment"])
-                    
+
     if prompt := st.chat_input(""):  
-        # if conversation_history:
-        #     prompt=pre_retrieval_tech_aws.llm_decomposer(params,st.session_state.messages,prompt) 
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        if params["memory"]:
+            prompt=pre_retrieval_tech_aws.llm_decomposer(params,st.session_state.messages,prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt,})
         with st.chat_message("user"):
-            st.markdown(prompt)       
-            
-        
+            st.markdown(prompt)      
+
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
-            answer=query_llm(params,prompt,message_placeholder)
+            answer, doc_name=query_llm(params,prompt,message_placeholder)
             message_placeholder.markdown(answer.replace("$","USD ").replace("%", " percent"))
-            st.session_state.messages.append({"role": "assistant", "content": answer}) 
+            st.session_state.messages.append({"role": "assistant", "content": answer,"attachment":doc_name}) 
         st.rerun()
 
 
@@ -196,20 +209,21 @@ def app_sidebar():
     with st.sidebar:               
         description = """### AI tool powered by suite of AWS services"""
         st.write(description)
-        st.text_input('Total Token Used', str(st.session_state['token'])) 
+        st.text_input('Total Token Used', str(st.session_state['input_token']+st.session_state['output_token'])) 
         st.write('---')
         st.write('### User Preference')
         filepath=None
         
         llm_model_name = st.selectbox('Select LL Model', options=MODELS_LLM.keys())
-        retriever = st.selectbox('Retriever', ["OpenSearch"])       
-        K=st.slider('Top K Results', min_value=1., max_value=10., value=3., step=1.,key='kendra')
+        retriever = st.selectbox('Retriever', ["OpenSearch","Kendra","KnowledgeBase"])       
+        K=st.slider('Top K Results', min_value=1., max_value=10., value=3., step=1.,key='kkendra')
+        mem = st.checkbox('chat memory')
         if "OpenSearch" in retriever:
-            embedding_model=st.selectbox('Embedding Model', MODELS_EMB.keys(),index =1)
+            embedding_model=st.selectbox('Embedding Model', MODELS_EMB.keys())
             knn=st.slider('Nearest Neighbour', min_value=1., max_value=100., value=3., step=1.)                
             engine=st.selectbox('KNN Library', ("nmslib", "lucene","faiss"), help="Underlying KNN algorithm implementation to use for powering the KNN search")
             if "nmslib" in engine:
-                space_type=st.selectbox("KNN Space",("l2","innerproduct", "cosinesimil", "l1", "linf"))
+                space_type=st.selectbox("KNN Space",("cosinesimil","l2","innerproduct",  "l1", "linf"))
             elif "lucene" in engine:
                 space_type=st.selectbox("KNN Space",("l2", "cosinesimil"))
             elif "faiss" in engine:
@@ -222,11 +236,11 @@ def app_sidebar():
 
             params = {'endpoint-llm':MODELS_LLM[llm_model_name],'model_name':llm_model_name, "emb_model":MODELS_EMB[embedding_model], "rag":retriever,"K":K, "engine":engine, "m":m,
                      "ef_search":ef_search, "ef_construction":ef_construction, "chunk":chunk, "domain":st.session_state['domain'], "knn":knn,
-                     'emb':embedding_model,"space_type":space_type }   
+                     'emb':embedding_model,"space_type":space_type,"memory":mem }   
 
         else:
 
-            params = {'action_name':action_name, 'endpoint-llm':MODELS_LLM[llm_model_name],"K":K,'max_len':max_len, 'top_p':top_p, 'temp':temp, 'model_name':llm_model_name, "rag":retriever}   
+            params = {'endpoint-llm':MODELS_LLM[llm_model_name],"K":K,'model_name':llm_model_name, "rag":retriever,"memory":mem }   
 
         file = st.file_uploader('Upload a PDF file', type=['pdf']) 
         if file is not None:
@@ -240,7 +254,6 @@ def app_sidebar():
 def main():
     params,f = app_sidebar()
     action_doc(params)
-
 
 if __name__ == '__main__':
     main()
