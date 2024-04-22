@@ -8,11 +8,14 @@ from textractor.visualizers.entitylist import EntityList
 from textractor.data.constants import TextractFeatures
 import io
 import inflect
+import concurrent.futures
+import fitz
 import boto3
 import openpyxl
+import time
+import streamlit as st
 from openpyxl.cell import Cell
 from openpyxl.worksheet.cell_range import CellRange
-s3=boto3.client("s3")
 from botocore.config import Config
 config = Config(
     read_timeout=600, 
@@ -20,44 +23,265 @@ config = Config(
         max_attempts = 5 
     )
 )
-bedrock_runtime = boto3.client(service_name='bedrock-runtime',region_name='us-east-1',config=config)
 import numpy as np
 from io import StringIO
-from opensearchpy import OpenSearch, RequestsHttpConnection
+from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
 from requests_aws4auth import AWS4Auth
 import re
 from opensearchpy import Transport
-TEXTRACT_RESULT_CACHE_PATH='textract-output'
-SAGEMAKER=boto3.client("sagemaker")
-KB_AGENT= boto3.client('bedrock-agent-runtime')
+
 APP_MD    = json.load(open('application_metadata_complete.json', 'r'))
 OS_ENDPOINT=APP_MD['opensearch']['domain_endpoint']
-KENDRA_INDEX= APP_MD['Kendra']['index']
 KB_INDEX= APP_MD['KnowledgeBase']['index']
+REGION    = APP_MD['region']
+KENDRA_BUCKET    = APP_MD['Kendra']['bucket']
+KENDRA_PREFIX    = APP_MD['Kendra']['prefix']
+KENDRA_ROLE=APP_MD['Kendra']['role']
+KENDRA_S3_DATA_SOURCE_NAME=APP_MD['Kendra']['s3_data_source_name']
+KENDRA_ID=APP_MD['Kendra']['index']
+OPENSEARCH_SERVERLESS    = APP_MD['opensearch']['serverless']
+OPENSEARCH_DOMAIN=APP_MD['opensearch']['domain_name']
+OPENSEARCH_BUCKET    = APP_MD['opensearch']['bucket']
+OPENSEARCH_PREFIX    = APP_MD['opensearch']['prefix']
+KB_BUCKET=APP_MD['KnowledgeBase']['bucket']
+KB_PREFIX=APP_MD['KnowledgeBase']['prefix']
+KB_DATASOURCE_ID=APP_MD['KnowledgeBase']['datasource_id']
+kb_agent_client= boto3.client('bedrock-agent', region_name=REGION)
+sagemaker=boto3.client("sagemaker-runtime", region_name=REGION)
+kb_agent= boto3.client('bedrock-agent-runtime', region_name=REGION)
+kendra=boto3.client("kendra", region_name=REGION)
+bedrock_runtime = boto3.client(service_name='bedrock-runtime',region_name=REGION,config=config)
+s3 = boto3.client('s3', region_name=REGION)
 
-def query_index(query,params): 
-    KENDRA=boto3.client("kendra")
-    response = KENDRA.retrieve(
-        IndexId=KENDRA_INDEX,
+
+# Vector dimension mappings of each embedding model
+EMB_MODEL_DICT={"titan":1536,
+                "minilmv2":384,
+                "bgelarge":1024,
+                "gtelarge":1024,
+                "e5largev2":1024,
+                "e5largemultilingual":1024,
+               "gptj6b":4096,
+                "cohere":1024}
+
+
+# Creating unique domain names for each embedding model using the domain name prefix set in the config json file
+# and a corresponding suffix of the embedding model name
+EMB_MODEL_DOMAIN_NAME={"titan":f"{APP_MD['opensearch']['domain_name']}_titan",
+                "minilmv2":f"{APP_MD['opensearch']['domain_name']}_minilm",
+                "bgelarge":f"{APP_MD['opensearch']['domain_name']}_bgelarge",
+                "gtelarge":f"{APP_MD['opensearch']['domain_name']}_gtelarge",
+                "e5largev2":f"{APP_MD['opensearch']['domain_name']}_e5large",
+                "e5largemultilingual":f"{APP_MD['opensearch']['domain_name']}_e5largeml",
+               "gptj6b":f"{APP_MD['opensearch']['domain_name']}_gptj6b",
+                       "cohere":f"{APP_MD['opensearch']['domain_name']}_cohere"}
+
+
+
+def query_index(query,params):     
+    response = kendra.retrieve(
+        IndexId=KENDRA_ID,
         QueryText=query,
         PageSize=int(params["K"])
     )
     return response
 
 def query_kb_index(query,params): 
-
-    response = KB_AGENT.retrieve(
+    response = kb_agent.retrieve(
             retrievalQuery= {
                 'text': query
             },
             knowledgeBaseId=KB_INDEX,
             retrievalConfiguration= {
                 'vectorSearchConfiguration': {
-                    'numberOfResults': int(params["K"]) # will fetch top 3 documents which matches closely with the query.
+                    'numberOfResults': int(params["K"]), # will fetch top 3 documents which matches closely with the query.
+                    'overrideSearchType': params["search_type"].upper()
                 }
             }
         )
     return response
+
+## KENDRA
+def kendra_index(doc_name):
+    """Create kendra s3 data source and sync files into kendra index"""
+    import time
+    response=kendra.list_data_sources(IndexId=KENDRA_ID)['SummaryItems']
+    data_sources=[x["Name"] for x in response if KENDRA_S3_DATA_SOURCE_NAME in x["Name"]]
+    if data_sources: # Check if s3 data source already exist and sync files
+        data_source_id=[x["Id"] for x in response if KENDRA_S3_DATA_SOURCE_NAME in x["Name"] ][0]
+        sync_response = kendra.start_data_source_sync_job(
+        Id = data_source_id,
+        IndexId =KENDRA_ID
+        )    
+        status=True
+        while status:
+            jobs = kendra.list_data_source_sync_jobs(
+                Id = data_source_id,
+                IndexId = KENDRA_ID
+            )
+            # For this example, there should be one job        
+            try:
+                status = jobs["History"][0]["Status"]
+                st.write(" Syncing data source. Status: "+status)
+                if status != "SYNCING":
+                    status=False
+                time.sleep(2)
+            except:
+                time.sleep(2)
+    else: # Create a Kendra s3 data source and sync files
+        new_data=True
+        data_source_id=[x["Id"] for x in response if "S3" in x["Type"]]
+        for ids in data_source_id:
+            response2 = kendra.describe_data_source(
+                    Id=ids,
+                    IndexId=KENDRA_ID,
+                )
+            if KENDRA_BUCKET in str(response2['Configuration']['S3Configuration']) and KENDRA_PREFIX in str(response2['Configuration']['S3Configuration']):   
+                new_data=False
+                sync_response = kendra.start_data_source_sync_job(
+                Id = ids,
+                IndexId =KENDRA_ID
+                )    
+                status=True
+                while status:
+                    jobs = kendra.list_data_source_sync_jobs(
+                        Id = data_source_id,
+                        IndexId = KENDRA_ID
+                    )
+                    # For this example, there should be one job        
+                    try:
+                        status = jobs["History"][0]["Status"]
+                        st.write(" Syncing data source. Status: "+status)
+                        if status != "SYNCING":
+                            status=False
+                        time.sleep(2)
+                    except:
+                        time.sleep(2)
+                break
+            
+        if new_data:
+            index_id=KENDRA_ID
+            response = kendra.create_data_source(
+                Name=KENDRA_S3_DATA_SOURCE_NAME,
+                IndexId=index_id,
+                Type='S3',
+                Configuration={
+                    'S3Configuration': {
+                        'BucketName': BUCKET,
+                        'InclusionPrefixes': [
+                            f"{PREFIX}/",
+                        ],            
+                    },
+                },     
+                RoleArn=KENDRA_ROLE, 
+                ClientToken=doc_name,                
+            )    
+            data_source_id=response['Id']
+            import time
+            status=True
+            while status:
+                # Get the details of the data source, such as the status
+                data_source_description = kendra.describe_data_source(
+                    Id = data_source_id,
+                    IndexId = index_id
+                )
+                # If status is not CREATING, then quit
+                status = data_source_description["Status"]
+                st.write(" Creating data source. Status: "+status)
+                time.sleep(2)
+                if status != "CREATING":
+                    status=False            
+            sync_response = kendra.start_data_source_sync_job(
+                Id = data_source_id,
+                IndexId = index_id
+            )    
+            status=True
+            while status:
+                jobs = kendra.list_data_source_sync_jobs(
+                    Id = data_source_id,
+                    IndexId = index_id
+                )
+
+                try:
+                    status = jobs["History"][0]["Status"]
+                    st.write(" Syncing data source. Status: "+status)
+                    if status != "SYNCING":
+                        status=False
+                    time.sleep(2)
+                except:
+                    time.sleep(2)
+                    
+                    
+## KNOWLEDGE BASE
+def kb_index_():
+    start_job_response=kb_agent_client.start_ingestion_job(knowledgeBaseId = KB_INDEX, dataSourceId = KB_DATASOURCE_ID)
+    job = start_job_response["ingestionJob"]
+    while(job['status']!='COMPLETE' ):
+        get_job_response = kb_agent_client.get_ingestion_job(
+          knowledgeBaseId = KB_INDEX,
+            dataSourceId = KB_DATASOURCE_ID,
+            ingestionJobId = job["ingestionJobId"]
+      )
+        job = get_job_response["ingestionJob"]
+        
+
+def parallelize_load_document(file_bytes_list, doc_name_list, params):
+    futures = []
+    future_doc_name_mapping = {}
+
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        for file_bytes, doc_name in zip(file_bytes_list, doc_name_list):
+            future = executor.submit(load_document, file_bytes, doc_name, params)
+            futures.append(future)
+            future_doc_name_mapping[future] = doc_name
+        for future in concurrent.futures.as_completed(futures):            
+            try:
+                result = future.result()            
+            except Exception as e:
+                doc_name = future_doc_name_mapping[future]
+                st.error(f"Error processing document '{doc_name}': {e}")
+                
+        
+def load_document(file_bytes, doc_name, params):
+    if "opensearch" in params["rag"].lower():
+        st.write('Opensearch Indexing...')
+        s3_path=f"{OPENSEARCH_PREFIX}/{doc_name}"
+        file_bytes=file_bytes.read()
+        s3.put_object(Body=file_bytes,Bucket= OPENSEARCH_BUCKET, Key=s3_path)       
+        time.sleep(1)    
+        s3_uri=f"s3://{OPENSEARCH_BUCKET}/{s3_path}"
+        with io.BytesIO(file_bytes) as open_pdf_file:   
+            doc = fitz.open(stream=open_pdf_file) 
+        if doc.page_count>1:    
+            text,config= call_amazon_textractor_on_pdf(s3_uri, True, False)
+        else:
+            text,config= call_amazon_textractor_on_pdf(s3_uri, True, False)
+        parse_text,parse_table=page_content_parser_aws(text,config)
+        chunks, table_header_dict, chunk_header_mapping=advanced_pdf_chunker_(params['chunk'], parse_text)
+        upload_pdf_chunk_to_s3(doc_name,chunk_header_mapping, OPENSEARCH_BUCKET)
+        params['pipeline_name']="normalization-pipe"
+        norm_pipeline(params['pipeline_name'],"min_max","arithmetic_mean")
+        params['dimension']=EMB_MODEL_DICT[params['emb'].lower()]
+        opensearch_document_loader_aws(params,chunks,table_header_dict,doc_name)
+        st.write('Opensearch Indexing Completed Succesfully')
+    elif "kendra" in params["rag"].lower():
+        for file in file_bytes:
+            s3_path=f"{KENDRA_PREFIX}/{file.name}"
+            file_byte=file.read()
+            s3.put_object(Body=file_byte,Bucket= KENDRA_BUCKET, Key=s3_path)       
+            time.sleep(1)  
+        st.write('Kendra Indexing...')
+        kendra_index(doc_name) 
+    elif "knowledgebase" in params["rag"].lower():
+        for file in file_bytes:
+            s3_path=f"{KB_PREFIX}/{file.name}"
+            file_byte=file.read()
+            s3.put_object(Body=file_byte,Bucket= KB_BUCKET, Key=s3_path)       
+            time.sleep(1)  
+        st.write('Bedrock KnowledgeBase Indexing...')   
+        kb_index_()
+        st.write("Ingestion Completed Successfully")
+
 
 def get_s3_keys(bucket, prefix):
     s3 = boto3.client('s3')
@@ -84,7 +308,25 @@ def _get_emb_(passage, model):
         payload = {'text_inputs': [passage]}
         payload = json.dumps(payload).encode('utf-8')
 
-        response = SAGEMAKER.invoke_endpoint(EndpointName=model, 
+        response = sagemaker.invoke_endpoint(EndpointName=model, 
+                                                    ContentType='application/json',  
+                                                    Body=payload)
+
+        model_predictions = json.loads(response['Body'].read())
+        embedding = model_predictions['embedding'][0]
+    elif "e5" in model:
+        payload = {"text_inputs":[passage],"mode":"embedding"} #{'text_inputs': [passage]}
+        payload = json.dumps(payload).encode('utf-8')
+        response = sagemaker.invoke_endpoint(EndpointName=model, 
+                                                    ContentType='application/json',  
+                                                    Body=payload)
+
+        model_predictions = json.loads(response['Body'].read())
+        embedding = model_predictions['embedding'][0]
+    elif "bge" in model:
+        payload = {"text_inputs":[passage],"mode":"embedding"} 
+        payload = json.dumps(payload).encode('utf-8')
+        response = sagemaker.invoke_endpoint(EndpointName=model, 
                                                     ContentType='application/json',  
                                                     Body=payload)
 
@@ -93,14 +335,6 @@ def _get_emb_(passage, model):
     return embedding
 
 def call_amazon_textractor_on_pdf(file, table, forms):
-    # match = re.match("s3://(.+?)/(.+)", file)
-    # bucket_name = match.group(1)
-    # key = match.group(2)    
-    # file_base_name=os.path.basename(file)
-    # if [x for x in get_s3_keys(bucket_name,f"{TEXTRACT_RESULT_CACHE_PATH}/") if file_base_name in x]:      
-    #     response = get_object_with_retry(BUCKET, f"{TEXTRACT_RESULT_CACHE_PATH}/{file_base_name}.txt")
-    #     text = response['Body'].read()
-    #     return text
     extractor = Textractor(region_name="us-east-1")
     doc_id=file_name = os.path.basename(file)
     textract_features=[TextractFeatures.LAYOUT]
@@ -130,7 +364,7 @@ def call_amazon_textractor_on_pdf(file, table, forms):
         hide_footer_layout=True,
         hide_page_num_layout=True,
     )    
-    # s3.put_object(Body=document.get_text(config=config), Bucket=bucket_name, Key=f"{TEXTRACT_RESULT_CACHE_PATH}/{file_base_name}.txt") 
+
     return document, config
 
 
@@ -572,11 +806,15 @@ def advanced_pdf_chunker_(max_words, header_split):
         chunks[title_ids] = title_chunks
         
     return     chunks, table_header_dict, chunk_header_mapping
-
-def upload_pdf_chunk_to_s3(doc_id,chunk_header_mapping, bucket):
-    with open (f"{doc_id}.json", "w") as f:
-        json.dump(chunk_header_mapping,f)
-    s3.upload_file(f"{doc_id}.json", bucket, f"{doc_id}.json")
+    
+def upload_pdf_chunk_to_s3(doc_id, chunk_header_mapping, bucket):
+    json_bytes = json.dumps(chunk_header_mapping).encode('utf-8')
+    json_file = io.BytesIO(json_bytes)
+    s3.upload_fileobj(
+        json_file,
+        bucket,
+        f"{OPENSEARCH_PREFIX}/{doc_id}.json"
+    )
     
     
 def norm_pipeline(pipeline_name,technique,combo_technique):
@@ -631,12 +869,12 @@ def read_file_from_s3(bucket_name, key, section_content, title_id=None,section_i
         str or None: The extracted section content as a string. Returns None if there's an error.
     """
     try:   
-        response = s3.get_object(Bucket=bucket_name, Key=key)        
+        response = s3.get_object(Bucket=bucket_name, Key=f"{OPENSEARCH_PREFIX}/{key}")        
         file_content = response['Body'].read().decode('utf-8')
         file_content=json.loads(file_content)
-        if section_content=="section_header":
+        if section_content=="header":
             passage=file_content[str(title_id)][str(section_id)]
-        elif section_content=="section_title":
+        elif section_content=="title":
             passage=[item for sublist in file_content[str(title_id)].values() for item in sublist]
         return "\n".join(passage)
     except Exception as e:
@@ -654,7 +892,7 @@ def content_extraction_os_(response:str, table:bool, section_content:str, bucket
     Parameters:
     response (dict): The response from OpenSearch containing search results.
     table (bool): A boolean indicating whether to include table content.
-    section_content (str): The type of content to extract. Allowed values are 'passage', 'section_header', or 'section_title'.
+    section_content (str): The type of content to extract. Allowed values are 'passage', 'header', or 'title'.
 
     Returns:
     tuple: A tuple containing concatenated passages and tables.
@@ -681,7 +919,7 @@ def content_extraction_os_(response:str, table:bool, section_content:str, bucket
         return passages, passage,doc_link
         
     elif "opensearch" in params['rag'].lower():
-        allowed_values = {"passage", "section_header", "section_title"}  # Define allowed values
+        allowed_values = {"passage", "header", "title"}  # Define allowed values
         if section_content not in allowed_values:
             raise InvalidContentError(f"Invalid content type '{section_content}'. Allowed values are {', '.join(allowed_values)}.")
 
@@ -718,9 +956,9 @@ def opensearch_document_loader_aws(params,chunks,table_header_dict,doc_id):
     """    
     
     domain_endpoint= OS_ENDPOINT
-    service = 'es'
+    service = "aoss" if OPENSEARCH_SERVERLESS else "es" 
     credentials = boto3.Session().get_credentials()
-    awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, "us-east-1", service, session_token=credentials.token)
+    awsauth =  AWSV4SignerAuth(credentials, REGION, service)
     os_ = OpenSearch(
         hosts = [{'host': domain_endpoint, 'port': 443}],
         http_auth = awsauth,
@@ -782,7 +1020,8 @@ def opensearch_document_loader_aws(params,chunks,table_header_dict,doc_id):
           }
         }
 
-    domain_index = f"{params['domain']}_{params['engine']}_{params['space_type']}" 
+    domain_index = OPENSEARCH_DOMAIN if OPENSEARCH_DOMAIN else f"{params['emb'].lower()}_{params['engine']}_{params['space_type']}" 
+    st.write(domain_index)
 
     if not os_.indices.exists(index=domain_index):        
         os_.indices.create(index=domain_index, body=mapping)
@@ -795,7 +1034,7 @@ def opensearch_document_loader_aws(params,chunks,table_header_dict,doc_id):
         print(f'{domain_index} Index already exists!')
 
     i = 1
-    SAGEMAKER=boto3.client('sagemaker-runtime')
+    
     for ids, chunkks in chunks.items(): # Iterate through the page title chunks 
         title_pattern = re.compile(r'<title>(.*?)(?:</title>|$)', re.DOTALL)       
         title_match = re.search(title_pattern, str(chunkks))
@@ -835,7 +1074,8 @@ def opensearch_document_loader_aws(params,chunks,table_header_dict,doc_id):
 
 def similarity_search(payload, params):     
     credentials = boto3.Session().get_credentials()
-    awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, "us-east-1", "es", session_token=credentials.token)
+    service = "aoss" if OPENSEARCH_SERVERLESS else "es"    
+    awsauth = AWS4Auth(credentials.access_key, credentials.secret_key, REGION, service, session_token=credentials.token)
     transport = Transport(
        hosts = [{'host': OS_ENDPOINT, 'port': 443}],
         http_auth = awsauth,
@@ -845,38 +1085,73 @@ def similarity_search(payload, params):
         # http_compress = True, # enables gzip compression for request bodies
         connection_class = RequestsHttpConnection
     )
-    domain_index=f"{params['domain']}_{params['engine']}_{params['space_type']}" 
+    domain_index=OPENSEARCH_DOMAIN if OPENSEARCH_DOMAIN else f"{params['emb'].lower()}_{params['engine']}_{params['space_type']}" 
     embedding=_get_emb_(payload,params['emb_model'])       
     # Define the search query
-    query = {   
-        'size': params["K"],
-        "_source": {
-        "exclude": [
-          "embedding"
-        ]
-      },
-        "query": {
-        "hybrid": {
-          "queries": [
-              {
-              "match": {
-                  "passage": payload
+    if not OPENSEARCH_SERVERLESS:
+        if "hybrid" in params["search_type"].lower():
+            query = {   
+                'size': params["K"],
+                "_source": {
+                "exclude": [
+                  "embedding"
+                ]
+              },
+                "query": {
+                "hybrid": {
+                  "queries": [
+                      {
+                      "match": {
+                          "passage": payload
+                        }
+                    },
+                      {
+                      "knn": {
+                      "embedding": {
+                        "vector": embedding,
+                        "k": params["knn"]
+                      }
+                    }
+                    },
+
+
+                  ]
                 }
-            },
-              {
-              "knn": {
-              "embedding": {
-                "vector": embedding,
-                "k": params["knn"]
               }
             }
-            },
+            # st.write(domain_index, service) 
+            response = transport.perform_request("GET", f"/{domain_index}/_search?search_pipeline={params['pipeline_name']}", body=query)
+        
+        elif "lexical"  in params["search_type"].lower():
+            query = {"query": {"match": {"passage": payload}}, "size": params["K"], "_source": {"exclude": ["embedding"]}}
+            response=transport.perform_request("GET", f"/{domain_index}/_search", body=query)
+        elif "semantic"  in params["search_type"].lower():
+            query= {"query": {"knn": {"embedding": {"vector": embedding, "k": params["knn"]}}}, 
+                    "size": params["K"], "_source": {"exclude": ["embedding"]}}
+            response =transport.perform_request("GET", f"/{domain_index}/_search", body=query)
 
+    else:
+        search_requests = [
+            ({}, {"query": {"match": {"passage": payload}}, "size": params["K"], "_source": {"exclude": ["embedding"]}}),
+            ({}, {"query": {"knn": {"embedding": {"vector": embedding, "k": params["knn"]}}}, "size": params["K"], "_source": {"exclude": ["embedding"]}})
+        ]
 
-          ]
-        }
-      }
-    }
-    # Send the search request with the defined query and search pipeline
-    response = transport.perform_request("GET", f"/{domain_index}/_search?search_pipeline={params['pipeline_name']}", body=query)
+        # Convert the search requests to NDJSON format
+        data = ""
+        for metadata, request in search_requests:
+            data += f"{json.dumps(metadata)}\n{json.dumps(request)}\n"
+        response = transport.perform_request("GET", f"/{domain_index}/_msearch", body=data)
+        # Separate the results    
+        lexical_search_results = response['responses'][0]
+        semantic_search_results = response['responses'][1]
+        # Use the custom hybrid search function
+        if "hybrid" in params["search_type"].lower():
+            hybrid_results = hybrid_search(lexical_search_results, semantic_search_results, 
+                                           interpolation_weight=0.5, normalizer="minmax", use_rrf=False, rrf_k=100)
+            response= hybrid_results
+        elif "lexical"  in params["search_type"].lower():
+            response= lexical_search_results
+        elif "semantic"  in params["search_type"].lower():
+            response= semantic_search_results
+        # Implement a combination technique or just pass one of either lexical or semantic search back
     return response
